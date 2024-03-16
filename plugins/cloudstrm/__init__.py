@@ -2,8 +2,11 @@ import json
 import os
 import shutil
 import urllib.parse
+import time
+import requests
 from datetime import datetime, timedelta
 from pathlib import Path
+from webdav3.client import Client
 
 import pytz
 from typing import Any, List, Dict, Tuple, Optional
@@ -26,7 +29,7 @@ class CloudStrm(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/create.png"
     # 插件版本
-    plugin_version = "3.6"
+    plugin_version = "3.6.1"
     # 插件作者
     plugin_author = "thsrite"
     # 作者主页
@@ -46,6 +49,9 @@ class CloudStrm(_PluginBase):
     _onlyonce = False
     _copy_files = False
     _rebuild = False
+    _alist_webdav = False
+    _dav_user = None
+    _dav_pass = None
     _observer = []
     _video_formats = ('.mp4', '.avi', '.rmvb', '.wmv', '.mov', '.mkv', '.flv', '.ts', '.webm', '.iso', '.mpg', '.m2ts')
     __cloud_files_json = "cloud_files.json"
@@ -77,6 +83,9 @@ class CloudStrm(_PluginBase):
             self._rebuild = config.get("rebuild")
             self._copy_files = config.get("copy_files")
             self._monitor_confs = config.get("monitor_confs")
+            self._alist_webdav = config.get("alist_webdav")
+            self._dav_user = config.get("dav_user")
+            self._dav_pass = config.get("dav_pass")
 
         # 停止现有任务
         self.stop_service()
@@ -212,6 +221,82 @@ class CloudStrm(_PluginBase):
             __save_flag = False
             for source_dir in self._dirconf.keys():
                 logger.info(f"正在处理监控文件 {source_dir}")
+                dav_user = self._dav_user
+                dav_pass = self._dav_pass
+                if not self._alist_webdav:
+                    for root, dirs, files in os.walk(source_dir):
+                        # 如果遇到名为'extrafanart'的文件夹，则跳过处理该文件夹，继续处理其他文件夹
+                        if "extrafanart" in dirs:
+                            dirs.remove("extrafanart")
+
+                        # 处理文件
+                        for file in files:
+                            source_file = os.path.join(root, file)
+                            # 回收站及隐藏的文件不处理
+                            if (source_file.find("/@Recycle") != -1
+                                    or source_file.find("/#recycle") != -1
+                                    or source_file.find("/.") != -1
+                                    or source_file.find("/@eaDir") != -1):
+                                logger.info(f"{source_file} 是回收站或隐藏的文件，跳过处理")
+                                continue
+
+                            # 不复制非媒体文件时直接过滤掉非媒体文件
+                            if not self._copy_files and not file.lower().endswith(self._video_formats):
+                                continue
+
+                            if source_file not in self.__cloud_files:
+                                logger.info(f"扫描到新文件 {source_file}，正在开始处理")
+                                # 云盘文件json新增
+                                self.__cloud_files.append(source_file)
+                                # 扫描云盘文件，判断是否有对应strm
+                                self.__strm(source_file)
+                                __save_flag = True
+                            else:
+                                logger.debug(f"{source_file} 已在缓存中！跳过处理")
+                else:
+                    for source_file in self._webdav_list_files(source_dir, dav_user, dav_pass):
+                        # 回收站及隐藏的文件不处理
+                        if (source_file.find("/@Recycle") != -1
+                                or source_file.find("/#recycle") != -1
+                                or source_file.find("/.") != -1
+                                or source_file.find("/@eaDir") != -1):
+                            logger.info(f"{source_file} 是回收站或隐藏的文件，跳过处理")
+                            continue
+                        # 不复制非媒体文件时直接过滤掉非媒体文件
+                        if not self._copy_files and not source_file.lower().endswith(self._video_formats):
+                            continue
+                        if source_file not in self.__cloud_files:
+                            logger.info(f"扫描到新文件 {source_file}，正在开始处理")
+                            # 云盘文件json新增
+                            self.__cloud_files.append(source_file)
+                            # 扫描云盘文件，判断是否有对应strm
+                            self.__strm(source_file)
+                            __save_flag = True
+                        else:
+                            logger.debug(f"{source_file} 已在缓存中！跳过处理")
+
+            
+
+            # 重新保存json文件
+            if __save_flag:
+                self.__sava_json()
+
+        logger.info("云盘strm生成任务完成")
+        if event:
+            self.post_message(channel=event.event_data.get("channel"),
+                              title="云盘strm生成任务完成！",
+                              userid=event.event_data.get("user"))
+
+    def __init_cloud_files_json(self):
+        """
+        初始化云盘文件json
+        """
+        # init
+        for source_dir in self._dirconf.keys():
+            logger.info(f"正在处理监控文件 {source_dir}")
+            dav_user = self._dav_user
+            dav_pass = self._dav_pass
+            if not self._alist_webdav:
                 for root, dirs, files in os.walk(source_dir):
                     # 如果遇到名为'extrafanart'的文件夹，则跳过处理该文件夹，继续处理其他文件夹
                     if "extrafanart" in dirs:
@@ -232,41 +317,13 @@ class CloudStrm(_PluginBase):
                         if not self._copy_files and not file.lower().endswith(self._video_formats):
                             continue
 
-                        if source_file not in self.__cloud_files:
-                            logger.info(f"扫描到新文件 {source_file}，正在开始处理")
-                            # 云盘文件json新增
-                            self.__cloud_files.append(source_file)
-                            # 扫描云盘文件，判断是否有对应strm
-                            self.__strm(source_file)
-                            __save_flag = True
-                        else:
-                            logger.debug(f"{source_file} 已在缓存中！跳过处理")
-
-            # 重新保存json文件
-            if __save_flag:
-                self.__sava_json()
-
-        logger.info("云盘strm生成任务完成")
-        if event:
-            self.post_message(channel=event.event_data.get("channel"),
-                              title="云盘strm生成任务完成！",
-                              userid=event.event_data.get("user"))
-
-    def __init_cloud_files_json(self):
-        """
-        初始化云盘文件json
-        """
-        # init
-        for source_dir in self._dirconf.keys():
-            logger.info(f"正在处理监控文件 {source_dir}")
-            for root, dirs, files in os.walk(source_dir):
-                # 如果遇到名为'extrafanart'的文件夹，则跳过处理该文件夹，继续处理其他文件夹
-                if "extrafanart" in dirs:
-                    dirs.remove("extrafanart")
-
-                # 处理文件
-                for file in files:
-                    source_file = os.path.join(root, file)
+                        logger.info(f"扫描到新文件 {source_file}，正在开始处理")
+                        # 云盘文件json新增
+                        self.__cloud_files.append(source_file)
+                        # 扫描云盘文件，判断是否有对应strm
+                        self.__strm(source_file)
+            else:
+                for source_file in self._webdav_list_files(source_dir, dav_user, dav_pass):
                     # 回收站及隐藏的文件不处理
                     if (source_file.find("/@Recycle") != -1
                             or source_file.find("/#recycle") != -1
@@ -274,22 +331,63 @@ class CloudStrm(_PluginBase):
                             or source_file.find("/@eaDir") != -1):
                         logger.info(f"{source_file} 是回收站或隐藏的文件，跳过处理")
                         continue
-
                     # 不复制非媒体文件时直接过滤掉非媒体文件
-                    if not self._copy_files and not file.lower().endswith(self._video_formats):
+                    if not self._copy_files and not source_file.lower().endswith(self._video_formats):
                         continue
+                    if source_file not in self.__cloud_files:
+                        logger.info(f"扫描到新文件 {source_file}，正在开始处理")
+                        # 云盘文件json新增
+                        self.__cloud_files.append(source_file)
+                        # 扫描云盘文件，判断是否有对应strm
+                        self.__strm(source_file)
+                        __save_flag = True
+                    else:
+                        logger.debug(f"{source_file} 已在缓存中！跳过处理")
 
-                    logger.info(f"扫描到新文件 {source_file}，正在开始处理")
-                    # 云盘文件json新增
-                    self.__cloud_files.append(source_file)
-                    # 扫描云盘文件，判断是否有对应strm
-                    self.__strm(source_file)
+
 
         # 写入本地文件
         if self.__cloud_files:
             self.__sava_json()
         else:
             logger.warning(f"未获取到文件列表")
+
+    def _webdav_list_files(self, source_dir, dav_user, dav_pass):
+        # 创建WebDAV客户端
+        options = {
+                'webdav_hostname': source_dir,
+                'webdav_login': dav_user,
+                'webdav_password': dav_pass
+        }
+
+
+        client = Client(options)
+        #path=[]
+        #wenjian=[]
+        files=[]
+        q=1
+        while q<15:
+                try:
+                   # 获取WebDAV服务器上的文件列表
+                        files = client.list()
+                except:
+                        q+=1
+                        logger.info(f"下载失败，1秒后重试...")
+                        time.sleep(1)
+                else:
+                        if q>1:
+                                logger.info(f"重连成功...")
+                        break
+
+        for file in files[1:]:
+                url=source_dir+file
+                #print(url)
+                if file[-1]=='/':
+                        yield from self._webdav_list_files(url, dav_user, dav_pass)
+                        #path.append(file)
+                else:
+                        yield url
+        #return path,wenjian
 
     def __sava_json(self):
         """
@@ -349,10 +447,31 @@ class CloudStrm(_PluginBase):
                                                     cloud_path=cloud_path,
                                                     cloud_url=cloud_url)
                         else:
-                            if self._copy_files:
+                            if self._copy_files and not self._alist_webdav:
                                 # 其他nfo、jpg等复制文件
                                 shutil.copy2(source_file, dest_file)
                                 logger.info(f"复制其他文件 {source_file} 到 {dest_file}")
+                            else:
+                                if self._copy_files and self._alist_webdav:
+                                    p=1
+                                    while p<10:
+                                            try:
+                                                    logger.info(f"正在下载 {source_file}")
+                                                    r=requests.get(source_file.replace('/dav','/d'))
+                                                    with open (dest_file,'wb') as f:
+                                                            f.write(r.content)
+                                                            f.close
+                                                    #wget.download(b.replace('/dav','/d'),save_mulu+b.replace(webdav_url,''))
+                                            except:
+                                                    p+=1
+                                                    logger.info(f"下载失败，1秒后重试...")
+                                                    time.sleep(1)
+                                            else:
+                                                    if p>1:
+                                                            logger.info(f"重新下载成功")
+                                                    break
+                                    
+
         except Exception as e:
             logger.error(f"create strm file error: {e}")
             print(str(e))
@@ -426,7 +545,10 @@ class CloudStrm(_PluginBase):
             "rebuild": self._rebuild,
             "copy_files": self._copy_files,
             "cron": self._cron,
-            "monitor_confs": self._monitor_confs
+            "monitor_confs": self._monitor_confs,
+            "alist_webdav": self._alist_webdav,
+            "dav_user": self._dav_user,
+            "dav_pass": self._dav_pass
         })
 
     def get_state(self) -> bool:
@@ -601,7 +723,7 @@ class CloudStrm(_PluginBase):
                                 'component': 'VCol',
                                 'props': {
                                     'cols': 12,
-                                    'md': 6
+                                    'md': 4
                                 },
                                 'content': [
                                     {
@@ -613,6 +735,61 @@ class CloudStrm(_PluginBase):
                                     }
                                 ]
                             },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'alist_webdav',
+                                            'label': 'webdav模式',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'dav_user',
+                                            'label': 'webdav用户名',
+                                            'placeholder': 'user'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'dav_pass',
+                                            'label': 'webdav密码',
+                                            'placeholder': 'password'
+                                        }
+                                    }
+                                ]
+                            }
                         ]
                     },
                     {
@@ -633,6 +810,7 @@ class CloudStrm(_PluginBase):
                                                     '1.监控目录#目的目录#媒体服务器内源文件路径；'
                                                     '2.监控目录#目的目录#cd2#cd2挂载本地跟路径#cd2服务地址；'
                                                     '3.监控目录#目的目录#alist#alist挂载本地跟路径#alist服务地址。'
+                                                    '4.webdav监控地址#目的目录#alist#webdav根地址#alist服务地址。'
                                         }
                                     }
                                 ]
@@ -713,7 +891,10 @@ class CloudStrm(_PluginBase):
             "onlyonce": False,
             "rebuild": False,
             "copy_files": False,
-            "monitor_confs": ""
+            "monitor_confs": "",
+            "alist_webdav":False,
+            "dav_user": "",
+            "dav_pass": ""
         }
 
     def get_page(self) -> List[dict]:
